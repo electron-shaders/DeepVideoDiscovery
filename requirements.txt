@@ -6,3 +6,5 @@ azure-identity
 requests
 yt-dlp
 openai
+fastmcp
+tenacity
