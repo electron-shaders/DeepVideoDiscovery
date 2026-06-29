@@ -27,16 +27,30 @@ def frame_inspect_tool(
     assert isinstance(database, NanoVectorDB), "Database must be an instance of NanoVectorDB"
     video_length_secs = convert_hhmmss_to_seconds(database.get_additional_data()['video_length'])
     video_meta = database.get_additional_data()
-    video_file_root = video_meta['video_file_root']
+    frame_file_root = os.path.dirname(database.storage_file)
     fps = video_meta.get('fps', config.VIDEO_FPS)
     time_ranges_secs = []
-    for time_range in time_ranges_hhmmss:
-        start_secs = convert_hhmmss_to_seconds(time_range[0])
-        end_secs = convert_hhmmss_to_seconds(time_range[1])
-        if start_secs > video_length_secs:
-            raise ValueError(f"One of start time {time_range[0]} exceeds video length {video_length_secs}")
-        end_secs = min(end_secs, video_length_secs)
-        time_ranges_secs.append((start_secs, end_secs))
+    if not time_ranges_hhmmss:
+        raise ValueError("time_ranges_hhmmss cannot be empty")
+    if isinstance(time_ranges_hhmmss, str):
+        print("Warning: time_ranges_hhmmss is an JSON-unparseable string. Trying to fix.")
+        time_ranges_hhmmss = json.loads(f"[{time_ranges_hhmmss}]")
+    if not isinstance(time_ranges_hhmmss[0], (list, tuple)):
+        for i in range(0, len(time_ranges_hhmmss), 2):
+            start_secs = convert_hhmmss_to_seconds(time_ranges_hhmmss[i])
+            end_secs = convert_hhmmss_to_seconds(time_ranges_hhmmss[i + 1])
+            if start_secs > video_length_secs:
+                raise ValueError(f"One of start time {time_ranges_hhmmss[i]} exceeds video length {convert_seconds_to_hhmmss(video_length_secs)}")
+            end_secs = min(end_secs, video_length_secs)
+            time_ranges_secs.append((start_secs, end_secs))
+    else:
+        for time_range in time_ranges_hhmmss:
+            start_secs = convert_hhmmss_to_seconds(time_range[0])
+            end_secs = convert_hhmmss_to_seconds(time_range[1])
+            if start_secs > video_length_secs:
+                raise ValueError(f"One of start time {time_range[0]} exceeds video length {convert_seconds_to_hhmmss(video_length_secs)}")
+            end_secs = min(end_secs, video_length_secs)
+            time_ranges_secs.append((start_secs, end_secs))
 
     time_ranges_secs.sort(key=lambda x: x[0])  # Sort by start time
     # Calculate total time across all ranges
@@ -96,7 +110,7 @@ def frame_inspect_tool(
     input_msgs[1]['content'] = input_msgs[1]['content'].format(question=question)
 
     files = [
-        os.path.join(video_file_root, "frames", f"frame_n{fn:06d}.jpg") for fn in framepoints
+        os.path.join(frame_file_root, "frames", f"frame_n{fn:06d}.jpg") for fn in framepoints
     ]
     msgs = call_openai_model_with_tools(
         messages=input_msgs,

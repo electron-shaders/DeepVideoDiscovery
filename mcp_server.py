@@ -29,6 +29,7 @@ import json
 import os
 import sys
 import threading
+import traceback
 
 # Redirect sys.stdout to sys.stderr for print() calls so they don't corrupt
 # the JSON-RPC stdio stream, while preserving sys.stdout.buffer for FastMCP.
@@ -47,9 +48,9 @@ class StderrRedirector:
 
 sys.stdout = StderrRedirector(sys.stdout)
 
-from mcp.server.fastmcp import FastMCP
 import dvd.config as config
 from dvd.utils import extract_answer
+from mcp.server.fastmcp import FastMCP
 
 # ---------------------------------------------------------------------------
 # Read config from environment and patch dvd.config
@@ -90,10 +91,17 @@ config.GLOBAL_BROWSE_TOPK                 = _browse_topk
 import openai as _openai
 from tenacity import (
     retry as _retry,
+)
+from tenacity import (
     retry_if_exception_type as _retry_if,
+)
+from tenacity import (
     stop_after_attempt as _stop,
+)
+from tenacity import (
     wait_exponential as _wait,
 )
+
 
 def _image_path_to_data_url(image_path: str) -> str:
     with open(image_path, "rb") as f:
@@ -163,8 +171,9 @@ def _get_embeddings_compat(endpoints=None, model_name=None, input_text=None, api
     return [{"embedding": item.embedding} for item in response.data]
 
 
-import dvd.utils as _du
 import dvd.build_database as _bdb
+import dvd.utils as _du
+
 _du.call_openai_model_with_tools = _call_openai_compat
 _du.AzureOpenAIEmbeddingService.get_embeddings = staticmethod(_get_embeddings_compat)
 _bdb.call_openai_model_with_tools = _call_openai_compat
@@ -216,8 +225,8 @@ def query_video(video_url: str, question: str) -> str:
         The answer to the question from the DVDCoreAgent.
     """
     from dvd.dvd_core import DVDCoreAgent
-    from dvd.video_utils import load_video, decode_video_to_frames
     from dvd.frame_caption import process_video
+    from dvd.video_utils import decode_video_to_frames, load_video
 
     video_id = get_video_id(video_url)
 
@@ -269,8 +278,8 @@ def run_dvd_query(
     Returns:
         The DVD agent's answer string.
     """
-    from dvd.dvd_core import DVDCoreAgent, StopException
     from dvd.build_database import init_single_video_db
+    from dvd.dvd_core import DVDCoreAgent, StopException
     from dvd.frame_caption import process_video, process_video_lite
     from nano_vectordb import NanoVectorDB
 
@@ -344,6 +353,10 @@ def run_dvd_query(
         msgs = agent.run(question)
     except StopException as exc:
         return str(exc)
+    except Exception as exc:
+        print(f"[dvd_mcp_server] run_dvd_query failed: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        raise
 
     if not msgs:
         return ""

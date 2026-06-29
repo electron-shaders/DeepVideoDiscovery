@@ -152,7 +152,7 @@ Question: QUESTION_PLACEHOLDER"""
 
             # Execute any requested tool calls
             try:
-                for tool_call in response.get("tool_calls", []):
+                for tool_call in (response.get("tool_calls", []) or []):
                     self._exec_tool(tool_call, msgs)
             except StopException:
                 return msgs
@@ -218,7 +218,7 @@ Question: QUESTION_PLACEHOLDER"""
 
             # Execute any requested tool calls
             try:
-                for tool_call in response.get("tool_calls", []):
+                for tool_call in (response.get("tool_calls", []) or []):
                     # Yield a formatted message about the tool being called
                     tool_name = tool_call.get("function", {}).get("name", "unknown")
                     tool_args = tool_call.get("function", {}).get("arguments", "{}")
