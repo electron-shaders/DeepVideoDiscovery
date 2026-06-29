@@ -1,6 +1,7 @@
 import json
 import multiprocessing
 import os
+import re
 from typing import Annotated as A
 
 import numpy as np
@@ -10,6 +11,23 @@ from tqdm import tqdm
 import dvd.config as config
 from dvd.func_call_shema import doc as D
 from dvd.utils import AzureOpenAIEmbeddingService, call_openai_model_with_tools
+
+
+def robust_list_parse(input_str: str, delimiter: str = ',', valid_pattern: re.Pattern | None = None):
+    res = []
+    current = ''
+    for char in input_str:
+        if char == delimiter:
+            if current:
+                res.append(current)
+                current = ''
+        else:
+            if valid_pattern is not None and not valid_pattern.match(char):
+                continue
+            current += char
+    if current:
+        res.append(current)
+    return res
 
 
 def frame_inspect_tool(
@@ -34,11 +52,14 @@ def frame_inspect_tool(
         raise ValueError("time_ranges_hhmmss cannot be empty")
     if isinstance(time_ranges_hhmmss, str):
         print("Warning: time_ranges_hhmmss is an JSON-unparseable string. Trying to fix.")
-        time_ranges_hhmmss = json.loads(f"[{time_ranges_hhmmss}]")
+        time_ranges_hhmmss = robust_list_parse(time_ranges_hhmmss, valid_pattern=re.compile(r'[\d:]'))
     if not isinstance(time_ranges_hhmmss[0], (list, tuple)):
         for i in range(0, len(time_ranges_hhmmss), 2):
             start_secs = convert_hhmmss_to_seconds(time_ranges_hhmmss[i])
-            end_secs = convert_hhmmss_to_seconds(time_ranges_hhmmss[i + 1])
+            if i + 1 >= len(time_ranges_hhmmss):
+                end_secs = video_length_secs
+            else:
+                end_secs = convert_hhmmss_to_seconds(time_ranges_hhmmss[i + 1])
             if start_secs > video_length_secs:
                 raise ValueError(f"One of start time {time_ranges_hhmmss[i]} exceeds video length {convert_seconds_to_hhmmss(video_length_secs)}")
             end_secs = min(end_secs, video_length_secs)
