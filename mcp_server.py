@@ -1,12 +1,5 @@
 """
-mcp_server.py — Deep Video Discovery MCP server.
-
-Extends the original server with a ``run_dvd_query`` tool that supports:
-  - Local video files (not just YouTube URLs)
-  - Per-video JIT database build (captions + vector index)
-  - Full config injection via environment variables so the server can be
-    started by dvd_adapter.py with the DVD venv and talk to any vLLM endpoint
-
+mcp_server.py — Deep Video Discovery MCP server (streamable-HTTP transport).
 Environment variables read at startup
 --------------------------------------
     DVD_BASE_URL          VLM server, e.g. "http://localhost:8000/v1"
@@ -21,6 +14,8 @@ Environment variables read at startup
     DVD_VIDEO_FPS         float (default: 2.0)
     DVD_GLOBAL_BROWSE_TOPK int (default: 300)
     DVD_DB_DIR            root dir for per-video databases (default: ./.dvd_dbs)
+    DVD_HOST              host to listen on (default: 127.0.0.1)
+    DVD_PORT              port to listen on (default: 9002)
 """
 
 import base64
@@ -31,23 +26,6 @@ import sys
 import threading
 import traceback
 
-# Redirect sys.stdout to sys.stderr for print() calls so they don't corrupt
-# the JSON-RPC stdio stream, while preserving sys.stdout.buffer for FastMCP.
-class StderrRedirector:
-    def __init__(self, original_stdout):
-        self._original_stdout = original_stdout
-    @property
-    def buffer(self):
-        return self._original_stdout.buffer
-    def write(self, s):
-        return sys.stderr.write(s)
-    def flush(self):
-        sys.stderr.flush()
-    def __getattr__(self, name):
-        return getattr(self._original_stdout, name)
-
-sys.stdout = StderrRedirector(sys.stdout)
-
 import dvd.config as config
 from dvd.utils import extract_answer
 from mcp.server.fastmcp import FastMCP
@@ -56,49 +34,48 @@ from mcp.server.fastmcp import FastMCP
 # Read config from environment and patch dvd.config
 # ---------------------------------------------------------------------------
 
-_base_url      = os.environ.get("DVD_BASE_URL", "http://localhost:8000/v1")
+_base_url       = os.environ.get("DVD_BASE_URL", "http://localhost:8000/v1")
 _embed_base_url = os.environ.get("DVD_EMBED_BASE_URL", "") or _base_url
-_api_key       = os.environ.get("DVD_API_KEY", "EMPTY")
-_vlm_model     = os.environ.get("DVD_VLM_MODEL", "")
-_embed_model   = os.environ.get("DVD_EMBED_MODEL", "BAAI/bge-m3")
-_embed_dim     = int(os.environ.get("DVD_EMBED_DIM", "1024"))
-_lite_mode     = os.environ.get("DVD_LITE_MODE", "true").lower() not in ("false", "0", "no")
-_max_iter      = int(os.environ.get("DVD_MAX_ITERATIONS", "15"))
-_clip_secs     = int(os.environ.get("DVD_CLIP_SECS", "10"))
-_video_fps     = float(os.environ.get("DVD_VIDEO_FPS", "2.0"))
-_browse_topk   = int(os.environ.get("DVD_GLOBAL_BROWSE_TOPK", "300"))
-_db_dir        = os.environ.get("DVD_DB_DIR", "./.dvd_dbs")
+_api_key        = os.environ.get("DVD_API_KEY", "EMPTY")
+_vlm_model      = os.environ.get("DVD_VLM_MODEL", "")
+_embed_model    = os.environ.get("DVD_EMBED_MODEL", "BAAI/bge-m3")
+_embed_dim      = int(os.environ.get("DVD_EMBED_DIM", "1024"))
+_lite_mode      = os.environ.get("DVD_LITE_MODE", "true").lower() not in ("false", "0", "no")
+_max_iter       = int(os.environ.get("DVD_MAX_ITERATIONS", "15"))
+_clip_secs      = int(os.environ.get("DVD_CLIP_SECS", "10"))
+_video_fps      = float(os.environ.get("DVD_VIDEO_FPS", "2.0"))
+_browse_topk    = int(os.environ.get("DVD_GLOBAL_BROWSE_TOPK", "300"))
+_db_dir         = os.environ.get("DVD_DB_DIR", "./.dvd_dbs")
+_host           = os.environ.get("DVD_HOST", "127.0.0.1")
+_port           = int(os.environ.get("DVD_PORT", "9002"))
 
 # Patch dvd.config before any DVD code imports it further
-config.OPENAI_API_KEY                  = _api_key
+config.OPENAI_API_KEY                      = _api_key
 config.AOAI_ORCHESTRATOR_LLM_ENDPOINT_LIST = [_base_url]
-config.AOAI_ORCHESTRATOR_LLM_MODEL_NAME   = _vlm_model
-config.AOAI_TOOL_VLM_ENDPOINT_LIST        = [_base_url]
-config.AOAI_TOOL_VLM_MODEL_NAME           = _vlm_model
-config.AOAI_CAPTION_VLM_ENDPOINT_LIST     = [_base_url]
-config.AOAI_CAPTION_VLM_MODEL_NAME        = _vlm_model
-config.AOAI_EMBEDDING_RESOURCE_LIST       = [_embed_base_url]
-config.AOAI_EMBEDDING_LARGE_MODEL_NAME    = _embed_model
-config.AOAI_EMBEDDING_LARGE_DIM           = _embed_dim
-config.LITE_MODE                          = _lite_mode
-config.MAX_ITERATIONS                     = _max_iter
-config.CLIP_SECS                          = _clip_secs
-config.VIDEO_FPS                          = _video_fps
-config.VIDEO_DATABASE_FOLDER              = _db_dir
-config.GLOBAL_BROWSE_TOPK                 = _browse_topk
+config.AOAI_ORCHESTRATOR_LLM_MODEL_NAME    = _vlm_model
+config.AOAI_TOOL_VLM_ENDPOINT_LIST         = [_base_url]
+config.AOAI_TOOL_VLM_MODEL_NAME            = _vlm_model
+config.AOAI_CAPTION_VLM_ENDPOINT_LIST      = [_base_url]
+config.AOAI_CAPTION_VLM_MODEL_NAME         = _vlm_model
+config.AOAI_EMBEDDING_RESOURCE_LIST        = [_embed_base_url]
+config.AOAI_EMBEDDING_LARGE_MODEL_NAME     = _embed_model
+config.AOAI_EMBEDDING_LARGE_DIM            = _embed_dim
+config.LITE_MODE                           = _lite_mode
+config.MAX_ITERATIONS                      = _max_iter
+config.CLIP_SECS                           = _clip_secs
+config.VIDEO_FPS                           = _video_fps
+config.VIDEO_DATABASE_FOLDER               = _db_dir
+config.GLOBAL_BROWSE_TOPK                  = _browse_topk
 
+# ---------------------------------------------------------------------------
 # Patch raw-HTTP calls → openai SDK so they reach the vLLM server
+# ---------------------------------------------------------------------------
+
 import openai as _openai
 from tenacity import (
     retry as _retry,
-)
-from tenacity import (
     retry_if_exception_type as _retry_if,
-)
-from tenacity import (
     stop_after_attempt as _stop,
-)
-from tenacity import (
     wait_exponential as _wait,
 )
 
@@ -107,6 +84,7 @@ def _image_path_to_data_url(image_path: str) -> str:
     with open(image_path, "rb") as f:
         data = base64.b64encode(f.read()).decode("utf-8")
     return f"data:image/jpeg;base64,{data}"
+
 
 def _call_openai_compat(
     messages, endpoints=None, model_name=None, api_key=None,
@@ -184,29 +162,36 @@ try:
 except ImportError:
     pass
 
-# Per-video build lock
-_build_locks: dict[str, threading.Lock] = {}
+# Per-video asyncio lock: serialises DB construction for the same video_id
+# across concurrent requests without blocking the event loop.
+import asyncio
+_build_locks: dict[str, asyncio.Lock] = {}
 _build_locks_meta = threading.Lock()
 
-def _get_build_lock(video_id: str) -> threading.Lock:
+
+def _get_build_lock(video_id: str) -> asyncio.Lock:
     with _build_locks_meta:
         if video_id not in _build_locks:
-            _build_locks[video_id] = threading.Lock()
+            _build_locks[video_id] = asyncio.Lock()
         return _build_locks[video_id]
 
+
 # ---------------------------------------------------------------------------
-# MCP server
+# FastMCP server  (stateless_http=True → new transport per request)
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("dvd_agent")
+mcp = FastMCP(
+    "dvd_agent",
+    host=_host,
+    port=_port,
+    stateless_http=True,   # each HTTP request is fully independent
+)
 
 
 def get_video_id(video_url: str) -> str:
     if "v=" in video_url:
-        video_id = video_url.split("v=")[1].split("&")[0]
-    else:
-        video_id = os.path.splitext(os.path.basename(video_url))[0]
-    return video_id
+        return video_url.split("v=")[1].split("&")[0]
+    return os.path.splitext(os.path.basename(video_url))[0]
 
 
 @mcp.tool()
@@ -255,7 +240,7 @@ def query_video(video_url: str, question: str) -> str:
 
 
 @mcp.tool()
-def run_dvd_query(
+async def run_dvd_query(
     video_path: str,
     question: str,
     dvd_db_dir: str = "",
@@ -266,7 +251,6 @@ def run_dvd_query(
 
     Supports pre-extracted databases (database.json only, no captions.json).
     Builds the per-video database on first call and caches it under dvd_db_dir.
-    Concurrent calls for the same video are serialized via a per-video lock.
 
     Args:
         video_path: Absolute path to the local video file.
@@ -278,85 +262,95 @@ def run_dvd_query(
     Returns:
         The DVD agent's answer string.
     """
+    loop = asyncio.get_event_loop()
+
     from dvd.build_database import init_single_video_db
     from dvd.dvd_core import DVDCoreAgent, StopException
     from dvd.frame_caption import process_video, process_video_lite
     from nano_vectordb import NanoVectorDB
 
-    db_dir = dvd_db_dir or _db_dir
-    config.VIDEO_DATABASE_FOLDER = db_dir
+    db_dir   = dvd_db_dir or _db_dir
     video_id = os.path.splitext(os.path.basename(video_path))[0]
-    lock = _get_build_lock(video_id)
 
     video_dir    = os.path.join(db_dir, video_id)
     caption_path = os.path.join(video_dir, "captions", "captions.json")
     db_path      = os.path.join(video_dir, "database.json")
+    db_exists    = await loop.run_in_executor(None, os.path.isfile, db_path)
 
-    with lock:
-        db_exists = os.path.isfile(db_path)
+    if not db_exists:
+        async with _get_build_lock(video_id):
+            db_exists = await loop.run_in_executor(None, os.path.isfile, db_path)
 
-        if not db_exists:
-            # --- Full build from scratch ---
-            os.makedirs(os.path.join(video_dir, "captions"), exist_ok=True)
-            have_srt = srt_path and os.path.isfile(srt_path)
+            if not db_exists:
+                # Full build from scratch — all blocking I/O in executor
+                def _build_db():
+                    os.makedirs(os.path.join(video_dir, "captions"), exist_ok=True)
+                    have_srt = bool(srt_path and os.path.isfile(srt_path))
 
-            if _lite_mode:
-                if have_srt:
-                    process_video_lite(os.path.join(video_dir, "captions"), srt_path)
-                else:
+                    if _lite_mode:
+                        if have_srt:
+                            process_video_lite(os.path.join(video_dir, "captions"), srt_path)
+                        else:
+                            with open(caption_path, "w") as f:
+                                json.dump({"subject_registry": {}}, f)
+                    else:
+                        from dvd.video_utils import decode_video_to_frames
+                        frames_dir_path = os.path.join(db_dir, video_id, "frames")
+                        if not os.path.isdir(frames_dir_path) or not os.listdir(frames_dir_path):
+                            decode_video_to_frames(video_path)
+                        process_video(
+                            frames_dir_path,
+                            os.path.join(video_dir, "captions"),
+                            subtitle_file_path=srt_path if have_srt else None,
+                        )
+                    init_single_video_db(caption_path, db_path, _embed_dim)
+
+                await loop.run_in_executor(None, _build_db)
+
+            elif not (await loop.run_in_executor(None, os.path.isfile, caption_path)):
+                # Pre-extracted DB: database.json exists but captions.json absent.
+                # Synthesise a minimal captions.json from the vector DB records.
+                def _synthesise_captions():
+                    os.makedirs(os.path.join(video_dir, "captions"), exist_ok=True)
+                    vdb        = NanoVectorDB(_embed_dim, storage_file=db_path)
+                    additional = vdb.get_additional_data() or {}
+                    captions_dict = {"subject_registry": additional.get("subject_registry", {})}
+                    for record in (vdb._data if hasattr(vdb, "_data") else []):
+                        t0  = record.get("time_start_secs", 0)
+                        t1  = record.get("time_end_secs", t0)
+                        key = f"{int(t0)}_{int(t1)}"
+                        captions_dict[key] = {"caption": record.get("caption", "")}
                     with open(caption_path, "w") as f:
-                        json.dump({"subject_registry": {}}, f)
-            else:
-                from dvd.video_utils import decode_video_to_frames
-                frames_dir = os.path.join(video_dir, "frames")
-                if not os.path.isdir(frames_dir) or not os.listdir(frames_dir):
-                    decode_video_to_frames(video_path)
-                process_video(
-                    frames_dir,
-                    os.path.join(video_dir, "captions"),
-                    subtitle_file_path=srt_path if have_srt else None,
-                )
-            init_single_video_db(caption_path, db_path, _embed_dim)
+                        json.dump(captions_dict, f)
 
-        elif not os.path.isfile(caption_path):
-            # --- Pre-extracted DB: database.json exists but captions.json is absent.
-            #     Synthesise a minimal captions.json from the already-loaded vector DB
-            #     so DVDCoreAgent can initialise without rebuilding anything. ---
-            os.makedirs(os.path.join(video_dir, "captions"), exist_ok=True)
-            vdb = NanoVectorDB(_embed_dim, storage_file=db_path)
-            additional = vdb.get_additional_data() or {}
-            subject_registry = additional.get("subject_registry", {})
-            # Reconstruct caption entries from the stored vector records
-            captions_dict = {"subject_registry": subject_registry}
-            for record in (vdb._data if hasattr(vdb, "_data") else []):
-                t0 = record.get("time_start_secs", 0)
-                t1 = record.get("time_end_secs", t0)
-                key = f"{int(t0)}_{int(t1)}"
-                captions_dict[key] = {"caption": record.get("caption", "")}
-            with open(caption_path, "w") as f:
-                json.dump(captions_dict, f)
+                await loop.run_in_executor(None, _synthesise_captions)
 
-        # --- Patch video_file_root in the loaded DB so frame_inspect_tool can
-        #     locate frames relative to the correct local directory.
-        # ---
-        if not _lite_mode:
-            vdb = NanoVectorDB(_embed_dim, storage_file=db_path)
-            additional = vdb.get_additional_data() or {}
-            local_video_dir = os.path.dirname(video_path)
-            if additional.get("video_file_root") != local_video_dir:
-                additional["video_file_root"] = local_video_dir
-                vdb.store_additional_data(**additional)
-                vdb.save()
+            # Patch video_file_root so frame_inspect_tool can locate frames.
+            if not _lite_mode:
+                def _patch_video_file_root():
+                    vdb         = NanoVectorDB(_embed_dim, storage_file=db_path)
+                    additional  = vdb.get_additional_data() or {}
+                    local_dir   = os.path.join(db_dir, video_id)
+                    if additional.get("video_file_root") != local_dir:
+                        additional["video_file_root"] = local_dir
+                        vdb.store_additional_data(**additional)
+                        vdb.save()
 
-    agent = DVDCoreAgent(db_path, caption_path, _max_iter)
-    try:
-        msgs = agent.run(question)
-    except StopException as exc:
-        return str(exc)
-    except Exception as exc:
-        print(f"[dvd_mcp_server] run_dvd_query failed: {exc}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        raise
+                await loop.run_in_executor(None, _patch_video_file_root)
+
+    # ── Agent inference (always concurrent across videos) ───────────────────
+    def _run_agent():
+        agent = DVDCoreAgent(db_path, caption_path, _max_iter)
+        try:
+            return agent.run(question)
+        except StopException as exc:
+            return [str(exc)]
+        except Exception as exc:
+            print(f"[dvd_mcp_server] run_dvd_query failed: {exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            raise
+
+    msgs = await loop.run_in_executor(None, _run_agent)
 
     if not msgs:
         return ""
@@ -368,4 +362,5 @@ def run_dvd_query(
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    print(f"[dvd_mcp_server] Starting streamable-HTTP server on {_host}:{_port}", file=sys.stderr)
+    mcp.run(transport="streamable-http")

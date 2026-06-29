@@ -1,42 +1,44 @@
 """
 dvd_adapter.py — MCP client adapter between lmms-eval and Deep Video Discovery.
 
-The DVD agent runs in a separate subprocess under the DVD venv
-(deepvideodiscovery/.venv) via the MCP stdio protocol.  This file manages:
-  - Spawning and keeping alive one persistent MCP server subprocess.
-  - Forwarding run_dvd_query() calls to it from any thread.
+The DVD agent runs as a persistent FastMCP streamable-HTTP server in the DVD
+venv (deepvideodiscovery/.venv).  This adapter manages:
+
+  - Launching the server subprocess once (init_dvd_instance).
+  - Issuing each run_dvd_query() call over a fresh, independent HTTP connection
+    so that all concurrent callers proceed in parallel — unlike the stdio
+    transport there is no shared session gate.
 
 No DVD dependencies are imported here; all DVD code runs in the subprocess.
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import os
+import subprocess
 import threading
-from concurrent.futures import Future
+import time
 from typing import Optional
+
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
 
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
-_init_lock = threading.Lock()
+_init_lock   = threading.Lock()
 _initialized = False
 
-# Config captured at init time — passed as env vars to the subprocess
+# Config captured at init time
 _server_env: dict[str, str] = {}
 _dvd_venv_python: str = "python"
 _mcp_server_script: str = ""
+_mcp_url: str = ""          # e.g. "http://127.0.0.1:9002/mcp"
+_mcp_client: Optional[Client] = None
 
-# Background asyncio thread that owns the MCP session
-_bg_thread: Optional[threading.Thread] = None
-_bg_loop: Optional[asyncio.AbstractEventLoop] = None
-
-# Async-side resources (only accessed from _bg_loop)
-_exit_stack: Optional[contextlib.AsyncExitStack] = None
-_session = None   # mcp.ClientSession
+# Server subprocess handle
+_server_proc: Optional[subprocess.Popen] = None
 
 
 # ---------------------------------------------------------------------------
@@ -58,10 +60,12 @@ def init_dvd_instance(
     global_browse_topk: int = 300,
     dvd_db_dir: str = "./.dvd_dbs",
     dvd_venv_python: str = "python",
+    dvd_host: str = "127.0.0.1",
+    dvd_port: int = 9002,
 ) -> None:
     """
-    Configure the DVD MCP session.  Must be called once on the main thread
-    before any run_dvd_query() calls.
+    Launch the DVD MCP HTTP server as a background subprocess and wait for it
+    to be ready.  Must be called once before any run_dvd_query() calls.
 
     Parameters
     ----------
@@ -92,10 +96,14 @@ def init_dvd_instance(
     dvd_db_dir : str
         Root directory for per-video databases.
     dvd_venv_python : str
-        Absolute path to the Python interpreter in the DVD venv, e.g.
-        "./deepvideodiscovery/.venv/bin/python".
+        Absolute path to the Python interpreter in the DVD venv.
+    dvd_host : str
+        Host for the DVD MCP HTTP server (default: 127.0.0.1).
+    dvd_port : int
+        Port for the DVD MCP HTTP server (default: 9002).
     """
     global _initialized, _server_env, _dvd_venv_python, _mcp_server_script
+    global _mcp_url, _mcp_client, _server_proc
 
     if _initialized:
         return
@@ -104,8 +112,9 @@ def init_dvd_instance(
         if _initialized:
             return
 
-        _dvd_venv_python = dvd_venv_python
+        _dvd_venv_python  = dvd_venv_python
         _mcp_server_script = os.path.join(dvd_path, "mcp_server.py")
+        _mcp_url           = f"http://{dvd_host}:{dvd_port}/mcp"
 
         if not os.path.isfile(_mcp_server_script):
             raise FileNotFoundError(
@@ -128,43 +137,41 @@ def init_dvd_instance(
             "DVD_VIDEO_FPS":          str(video_fps),
             "DVD_GLOBAL_BROWSE_TOPK": str(global_browse_topk),
             "DVD_DB_DIR":             dvd_db_dir,
+            "DVD_HOST":               dvd_host,
+            "DVD_PORT":               str(dvd_port),
         }
 
-        _initialized = True
-
-
-# ---------------------------------------------------------------------------
-# MCP Session Management
-# ---------------------------------------------------------------------------
-
-_session_lock: Optional[asyncio.Lock] = None
-
-async def _get_session():
-    global _session, _exit_stack, _session_lock
-    if _session is not None:
-        return _session
-
-    if _session_lock is None:
-        _session_lock = asyncio.Lock()
-
-    async with _session_lock:
-        if _session is not None:
-            return _session
-
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-
-        server_params = StdioServerParameters(
-            command=_dvd_venv_python,
-            args=[_mcp_server_script],
+        # Launch the DVD MCP server as a background subprocess.
+        _server_proc = subprocess.Popen(
+            [_dvd_venv_python, _mcp_server_script],
             env=_server_env,
+            stdout=subprocess.DEVNULL,
+            stderr=None,         # inherit stderr so logs are visible
         )
 
-        _exit_stack = contextlib.AsyncExitStack()
-        read, write = await _exit_stack.enter_async_context(stdio_client(server_params))
-        _session = await _exit_stack.enter_async_context(ClientSession(read, write))
-        await _session.initialize()
-        return _session
+        # Wait for the HTTP server to accept connections.
+        import httpx
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if _server_proc.poll() is not None:
+                raise RuntimeError(
+                    f"[dvd_adapter] MCP server subprocess exited early "
+                    f"(returncode={_server_proc.returncode})."
+                )
+            try:
+                httpx.get(_mcp_url.replace("/mcp", "/"), timeout=1.0)
+                break
+            except Exception:
+                time.sleep(0.5)
+        else:
+            _server_proc.kill()
+            raise RuntimeError(
+                f"[dvd_adapter] DVD MCP server at {_mcp_url} did not become "
+                f"ready within 60 s."
+            )
+
+        _mcp_client = Client(StreamableHttpTransport(_mcp_url))
+        _initialized = True
 
 
 # ---------------------------------------------------------------------------
@@ -180,10 +187,10 @@ async def run_dvd_query(
     srt_path: Optional[str] = None,
 ) -> str:
     """
-    Run the DVD agent for a (video, question) pair via the MCP subprocess.
+    Run the DVD agent for a (video, question) pair via the MCP HTTP server.
 
-    The per-video database is built and cached on first call inside the
-    MCP server process (DVD venv).  Must be awaited from an asyncio event loop.
+    Each call opens its own independent HTTP session, so concurrent calls for
+    different videos proceed in parallel with no shared lock.
 
     Returns
     -------
@@ -200,22 +207,25 @@ async def run_dvd_query(
         candidate = os.path.splitext(video_path)[0] + ".srt"
         srt_path = candidate if os.path.isfile(candidate) else ""
 
-    session = await _get_session()
-
     try:
-        result = await session.call_tool(
-            "run_dvd_query",
-            {
-                "video_path": video_path,
-                "question": question,
-                "dvd_db_dir": dvd_db_dir,
-                "srt_path": srt_path,
-            },
-        )
+        async with _mcp_client:
+            result = await _mcp_client.call_tool(
+                "run_dvd_query",
+                {
+                    "video_path": video_path,
+                    "question":   question,
+                    "dvd_db_dir": dvd_db_dir,
+                    "srt_path":   srt_path,
+                },
+            )
         if result and result.content:
-            return result.content[0].text if hasattr(result.content[0], "text") else str(result.content[0])
+            return (
+                result.content[0].text
+                if hasattr(result.content[0], "text")
+                else str(result.content[0])
+            )
         return ""
-    except Exception as exc:
+    except Exception:
         import traceback
         traceback.print_exc()
         return ""
