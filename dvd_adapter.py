@@ -1,7 +1,7 @@
 """
 dvd_adapter.py — MCP client adapter between lmms-eval and Deep Video Discovery.
 
-The DVD agent runs as a persistent FastMCP streamable-HTTP server in the DVD
+The DVD agent runs as a persistent MCP streamable-HTTP server in the DVD
 venv (deepvideodiscovery/.venv).  This adapter manages:
 
   - Launching the server subprocess once (init_dvd_instance).
@@ -15,14 +15,15 @@ No DVD dependencies are imported here; all DVD code runs in the subprocess.
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import threading
 import time
 from typing import Optional
 
-import httpx
-from fastmcp import Client
-from fastmcp.client.transports import StreamableHttpTransport
+import httpx2
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
 
 # ---------------------------------------------------------------------------
 # State
@@ -36,16 +37,14 @@ _server_env: dict[str, str] = {}
 _dvd_venv_python: str = "python"
 _mcp_server_script: str = ""
 _mcp_url: str = ""          # e.g. "http://127.0.0.1:9002/mcp"
-_mcp_client: Optional[Client] = None
 
 # Server subprocess handle
 _server_proc: Optional[subprocess.Popen] = None
 
 
-def _indefinite_httpx_client_factory(**kwargs) -> httpx.AsyncClient:
-    """Create the MCP HTTP client without a request/read deadline."""
-    kwargs["timeout"] = None
-    return httpx.AsyncClient(**kwargs)
+def _indefinite_http_client() -> httpx2.AsyncClient:
+    """Create an MCP HTTP client without a request/read deadline."""
+    return httpx2.AsyncClient(timeout=None, follow_redirects=True)
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +109,7 @@ def init_dvd_instance(
         Port for the DVD MCP HTTP server (default: 9002).
     """
     global _initialized, _server_env, _dvd_venv_python, _mcp_server_script
-    global _mcp_url, _mcp_client, _server_proc
+    global _mcp_url, _server_proc
 
     if _initialized:
         return
@@ -165,9 +164,10 @@ def init_dvd_instance(
                     f"(returncode={_server_proc.returncode})."
                 )
             try:
-                httpx.get(_mcp_url.replace("/mcp", "/"), timeout=1.0)
+                with socket.create_connection((dvd_host, dvd_port), timeout=1.0):
+                    pass
                 break
-            except Exception:
+            except OSError:
                 time.sleep(0.5)
         else:
             _server_proc.kill()
@@ -176,13 +176,6 @@ def init_dvd_instance(
                 f"ready within 60 s."
             )
 
-        # FastMCP's default HTTP client has a finite SSE read timeout.  Keep
-        # the outer MCP request alive for as long as the DVD model calls need.
-        transport = StreamableHttpTransport(
-            _mcp_url,
-            httpx_client_factory=_indefinite_httpx_client_factory,
-        )
-        _mcp_client = Client(transport, timeout=None)
         _initialized = True
 
 
@@ -220,16 +213,23 @@ async def run_dvd_query(
         srt_path = candidate if os.path.isfile(candidate) else ""
 
     try:
-        async with _mcp_client:
-            result = await _mcp_client.call_tool(
-                "run_dvd_query",
-                {
-                    "video_path": video_path,
-                    "question":   question,
-                    "dvd_db_dir": dvd_db_dir,
-                    "srt_path":   srt_path,
-                },
+        # MCP 2 clients and transport context managers are single-use.  A new
+        # pair per query also ensures concurrent calls never share a session.
+        async with _indefinite_http_client() as http_client:
+            transport = streamable_http_client(
+                _mcp_url,
+                http_client=http_client,
             )
+            async with Client(transport, read_timeout_seconds=None) as mcp_client:
+                result = await mcp_client.call_tool(
+                    "run_dvd_query",
+                    {
+                        "video_path": video_path,
+                        "question":   question,
+                        "dvd_db_dir": dvd_db_dir,
+                        "srt_path":   srt_path,
+                    },
+                )
         if result and result.content:
             return (
                 result.content[0].text
