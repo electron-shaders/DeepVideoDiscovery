@@ -16,7 +16,7 @@ from dvd.utils import AzureOpenAIEmbeddingService, call_openai_model_with_tools
 # Embedding calls are HTTP-bound.  A single process-wide executor keeps
 # concurrent video builds bounded and avoids forking from the multithreaded
 # FastMCP/Uvicorn server.
-_EMBEDDING_MAX_WORKERS = 16
+_EMBEDDING_MAX_WORKERS = 64
 _EMBEDDING_EXECUTOR = ThreadPoolExecutor(
     max_workers=_EMBEDDING_MAX_WORKERS,
     thread_name_prefix="dvd-embedding",

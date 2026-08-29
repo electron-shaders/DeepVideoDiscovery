@@ -16,7 +16,7 @@ from dvd.utils import call_openai_model_with_tools
 # own pool.  In particular, do not fork from the multithreaded MCP server:
 # forked children inherit Uvicorn's signal handlers and cannot be reliably
 # terminated by multiprocessing.Pool.
-_CAPTION_MAX_WORKERS = 16
+_CAPTION_MAX_WORKERS = 64
 _CAPTION_EXECUTOR = ThreadPoolExecutor(
     max_workers=_CAPTION_MAX_WORKERS,
     thread_name_prefix="dvd-caption",
@@ -348,7 +348,7 @@ def process_video(
 
     # ---------------- Parallel captioning --------------- #
     # All concurrent videos share this executor, bounding aggregate VLM
-    # pressure at _CAPTION_MAX_WORKERS rather than 16 workers per video.
+    # pressure at _CAPTION_MAX_WORKERS.
     future_to_timestamp = {
         _CAPTION_EXECUTOR.submit(_caption_clip, clip, caption_ckpt_folder): clip[0]
         for clip in clips
