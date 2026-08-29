@@ -129,7 +129,7 @@ def call_openai_model_with_tools(
         for image_data in image_data_list:
             payload['messages'][-1]['content'].append({"type": "image_url", "image_url": {"url": image_data}})
       
-    response = requests.post(url, headers=headers, json=payload, timeout=600)  
+    response = requests.post(url, headers=headers, json=payload, timeout=None)
   
     if response.status_code != 200:
         error_text = response.text
@@ -193,7 +193,12 @@ class AzureOpenAIEmbeddingService:
         }  
   
         # Make the request to the Azure OpenAI service  
-        response = requests.post(url, headers=headers, data=json.dumps(payload))  
+        response = requests.post(
+            url,
+            headers=headers,
+            data=json.dumps(payload),
+            timeout=None,
+        )
   
         # Check if the request was successful  
         if response.status_code == 200:  

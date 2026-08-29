@@ -20,6 +20,7 @@ import threading
 import time
 from typing import Optional
 
+import httpx
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
@@ -39,6 +40,12 @@ _mcp_client: Optional[Client] = None
 
 # Server subprocess handle
 _server_proc: Optional[subprocess.Popen] = None
+
+
+def _indefinite_httpx_client_factory(**kwargs) -> httpx.AsyncClient:
+    """Create the MCP HTTP client without a request/read deadline."""
+    kwargs["timeout"] = None
+    return httpx.AsyncClient(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +157,6 @@ def init_dvd_instance(
         )
 
         # Wait for the HTTP server to accept connections.
-        import httpx
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             if _server_proc.poll() is not None:
@@ -170,7 +176,13 @@ def init_dvd_instance(
                 f"ready within 60 s."
             )
 
-        _mcp_client = Client(StreamableHttpTransport(_mcp_url))
+        # FastMCP's default HTTP client has a finite SSE read timeout.  Keep
+        # the outer MCP request alive for as long as the DVD model calls need.
+        transport = StreamableHttpTransport(
+            _mcp_url,
+            httpx_client_factory=_indefinite_httpx_client_factory,
+        )
+        _mcp_client = Client(transport, timeout=None)
         _initialized = True
 
 

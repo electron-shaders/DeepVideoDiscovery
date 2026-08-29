@@ -98,7 +98,7 @@ def _call_openai_compat(
             payload_messages[-1]["content"].append(
                 {"type": "image_url", "image_url": {"url": _image_path_to_data_url(p)}}
             )
-    client = _openai.OpenAI(base_url=_base_url, api_key=_api_key)
+    client = _openai.OpenAI(base_url=_base_url, api_key=_api_key, timeout=None)
     kwargs = dict(
         model=model_name or _vlm_model,
         messages=payload_messages,
@@ -121,10 +121,13 @@ def _call_openai_compat(
         return client.chat.completions.create(**kwargs)
 
     try:
-        response = _call()
-    except Exception as exc:
-        print(f"[dvd_mcp_server] LLM call failed: {exc}", file=sys.stderr)
-        return None
+        try:
+            response = _call()
+        except Exception as exc:
+            print(f"[dvd_mcp_server] LLM call failed: {exc}", file=sys.stderr)
+            return None
+    finally:
+        client.close()
 
     msg = response.choices[0].message
     if msg.tool_calls:
@@ -144,8 +147,18 @@ def _call_openai_compat(
 
 
 def _get_embeddings_compat(endpoints=None, model_name=None, input_text=None, api_key=None):
-    client = _openai.OpenAI(base_url=_embed_base_url, api_key=_api_key)
-    response = client.embeddings.create(model=model_name or _embed_model, input=input_text)
+    client = _openai.OpenAI(
+        base_url=_embed_base_url,
+        api_key=_api_key,
+        timeout=None,
+    )
+    try:
+        response = client.embeddings.create(
+            model=model_name or _embed_model,
+            input=input_text,
+        )
+    finally:
+        client.close()
     return [{"embedding": item.embedding} for item in response.data]
 
 
@@ -291,8 +304,10 @@ async def run_dvd_query(
                         if have_srt:
                             process_video_lite(os.path.join(video_dir, "captions"), srt_path)
                         else:
-                            with open(caption_path, "w") as f:
-                                json.dump({"subject_registry": {}}, f)
+                            raise FileNotFoundError(
+                                "DVD lite mode requires an SRT subtitle for "
+                                f"video '{video_path}'."
+                            )
                     else:
                         from dvd.video_utils import decode_video_to_frames
                         frames_dir_path = os.path.join(db_dir, video_id, "frames")

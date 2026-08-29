@@ -1,14 +1,26 @@
 import copy
-import functools
 import json
-import multiprocessing as mp
 import os
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
 
 from tqdm import tqdm
 
 import dvd.config as config
 from dvd.utils import call_openai_model_with_tools
+
+
+# Caption requests are HTTP-bound.  Keep one process-wide executor so
+# concurrent video builds share the same limit instead of each creating its
+# own pool.  In particular, do not fork from the multithreaded MCP server:
+# forked children inherit Uvicorn's signal handlers and cannot be reliably
+# terminated by multiprocessing.Pool.
+_CAPTION_MAX_WORKERS = 16
+_CAPTION_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_CAPTION_MAX_WORKERS,
+    thread_name_prefix="dvd-caption",
+)
 
 # --------------------------------------------------------------------------- #
 #                              Prompt templates                               #
@@ -227,25 +239,49 @@ def _caption_clip(task: Tuple[str, Dict], caption_ckpt_folder) -> Tuple[str, dic
     tries = 3
     while tries:
         tries -= 1
-        resp = call_openai_model_with_tools(
+        response = call_openai_model_with_tools(
             send_messages,
             endpoints=config.AOAI_CAPTION_VLM_ENDPOINT_LIST,
             model_name=config.AOAI_CAPTION_VLM_MODEL_NAME,
             return_json=True,
             image_paths=files,
             api_key=config.OPENAI_API_KEY,
-        )["content"]
-        if resp is None:
+        )
+        if not isinstance(response, dict):
+            print(
+                f"Invalid caption response for {timestamp}: expected an object, "
+                f"got {type(response).__name__}; retrying...",
+                file=sys.stderr,
+            )
             continue
+
+        resp = response.get("content")
         try:
-            assert isinstance(resp, str), f"Response must be a JSON string instead of {type(resp)}:{resp}."
+            if not isinstance(resp, str):
+                raise TypeError(
+                    f"content must be a JSON string, got {type(resp).__name__}"
+                )
             parsed = json.loads(resp)
-            parsed["clip_description"] += f"\n\nTranscript during this video clip: {transcript}." # add transcript to description
-            resp = json.dumps(parsed)
+            if not isinstance(parsed, dict):
+                raise TypeError(
+                    f"caption JSON must be an object, got {type(parsed).__name__}"
+                )
+            if not isinstance(parsed.get("clip_description"), str):
+                raise TypeError("clip_description must be a string")
+            if not isinstance(parsed.get("subject_registry"), dict):
+                raise TypeError("subject_registry must be an object")
+
+            parsed["clip_description"] += (
+                f"\n\nTranscript during this video clip: {transcript}."
+            )
             with open(os.path.join(caption_ckpt_folder, f"{timestamp}.json"), "w") as f:
-                f.write(resp)
+                json.dump(parsed, f)
             return timestamp, parsed
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError) as exc:
+            print(
+                f"Invalid caption JSON for {timestamp}: {exc}; retrying...",
+                file=sys.stderr,
+            )
             continue
     return timestamp, {}  # give up
 
@@ -267,18 +303,32 @@ def merge_subject_registries(registries: List[dict]) -> dict:
     tries = 3
     while tries:
         tries -= 1
-        resp = call_openai_model_with_tools(
+        response = call_openai_model_with_tools(
             send_messages,
             endpoints=config.AOAI_CAPTION_VLM_ENDPOINT_LIST,
             model_name=config.AOAI_CAPTION_VLM_MODEL_NAME,
             return_json=True,
             api_key=config.OPENAI_API_KEY,
-        )["content"]
-        if resp is None:
+        )
+        if not isinstance(response, dict):
             continue
+        resp = response.get("content")
         try:
-            return json.loads(resp)
-        except json.JSONDecodeError:
+            if not isinstance(resp, str):
+                raise TypeError(
+                    f"content must be a JSON string, got {type(resp).__name__}"
+                )
+            merged = json.loads(resp)
+            if not isinstance(merged, dict):
+                raise TypeError(
+                    f"subject_registry must be an object, got {type(merged).__name__}"
+                )
+            return merged
+        except (json.JSONDecodeError, TypeError) as exc:
+            print(
+                f"Invalid merged subject registry: {exc}; retrying...",
+                file=sys.stderr,
+            )
             continue
     return {}  # fallback
 
@@ -296,19 +346,30 @@ def process_video(
 
     clips = gather_clip_frames(frame_folder, config.CLIP_SECS, subtitle_file_path)
 
-    caption_clip = functools.partial(
-        _caption_clip,
-        caption_ckpt_folder=caption_ckpt_folder,
-    )
     # ---------------- Parallel captioning --------------- #
-    with mp.Pool(16) as pool:
-        results = list(
-            tqdm(
-                pool.imap_unordered(caption_clip, clips),
-                total=len(clips),
-                desc=f"Captioning {frame_folder}",
+    # All concurrent videos share this executor, bounding aggregate VLM
+    # pressure at _CAPTION_MAX_WORKERS rather than 16 workers per video.
+    future_to_timestamp = {
+        _CAPTION_EXECUTOR.submit(_caption_clip, clip, caption_ckpt_folder): clip[0]
+        for clip in clips
+    }
+    results = []
+    for future in tqdm(
+        as_completed(future_to_timestamp),
+        total=len(future_to_timestamp),
+        desc=f"Captioning {frame_folder}",
+    ):
+        timestamp = future_to_timestamp[future]
+        try:
+            results.append(future.result())
+        except Exception as exc:
+            # A single malformed response or corrupt frame must not abort the
+            # whole video and strand all of its other caption requests.
+            print(
+                f"Captioning failed for {frame_folder} clip {timestamp}: {exc}",
+                file=sys.stderr,
             )
-        )
+            results.append((timestamp, {}))
 
     # ---------------- Save per-clip JSON ---------------- #
     partial_registries = []

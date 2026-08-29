@@ -1,7 +1,7 @@
 import json
-import multiprocessing
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Annotated as A
 
 import numpy as np
@@ -11,6 +11,16 @@ from tqdm import tqdm
 import dvd.config as config
 from dvd.func_call_shema import doc as D
 from dvd.utils import AzureOpenAIEmbeddingService, call_openai_model_with_tools
+
+
+# Embedding calls are HTTP-bound.  A single process-wide executor keeps
+# concurrent video builds bounded and avoids forking from the multithreaded
+# FastMCP/Uvicorn server.
+_EMBEDDING_MAX_WORKERS = 16
+_EMBEDDING_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_EMBEDDING_MAX_WORKERS,
+    thread_name_prefix="dvd-embedding",
+)
 
 
 def robust_list_parse(input_str: str, delimiter: str = ',', valid_pattern: re.Pattern | None = None):
@@ -340,15 +350,16 @@ def preprocess_captions(caption_json_path):
     for i in range(0, len(scripts), batch_size):
         batch = scripts[i:i+batch_size]
         batched_scripts.append(batch)
+    futures = [
+        _EMBEDDING_EXECUTOR.submit(single_batch_embedding_task, batch)
+        for batch in batched_scripts
+    ]
     cap2emb_list = []
-    with multiprocessing.Pool(os.cpu_count() // 2) as pool:
-        with tqdm(total=len(scripts), desc="Embedding captions...") as pbar:
-            for result in pool.imap_unordered(
-                single_batch_embedding_task,
-                batched_scripts,
-            ):
-                cap2emb_list.extend(result)
-                pbar.update(len(result))
+    with tqdm(total=len(scripts), desc="Embedding captions...") as pbar:
+        for future in as_completed(futures):
+            result = future.result()
+            cap2emb_list.extend(result)
+            pbar.update(len(result))
     return cap2emb_list
 
 def single_batch_embedding_task(data):
