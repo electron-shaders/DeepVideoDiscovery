@@ -10,6 +10,7 @@ from mimetypes import guess_type
 import cv2
 import requests
 from azure.identity import AzureCliCredential
+from dvd.sampling import qwen35_request_kwargs
 
 
 def retry_with_exponential_backoff(
@@ -83,7 +84,8 @@ def call_openai_model_with_tools(
     temperature: float = 0.0,  
     tool_choice: str = "auto",  # Can be "auto", "none", or a specific tool
     return_json: bool = False,
-) -> dict:  
+    enable_thinking=None,
+) -> dict:
     if api_key:
         headers = {  
             "Content-Type": "application/json",  
@@ -108,11 +110,15 @@ def call_openai_model_with_tools(
 
     model = model_name
       
-    payload = {  
+    payload = {
         "model": model,
         "messages": copy.deepcopy(messages),  
         # "reasoning_effort": reasoning_effort,
-    }  
+    }
+    sampling = qwen35_request_kwargs(model_name, enable_thinking=enable_thinking)
+    extra = sampling.pop("extra_body", {})
+    payload.update(sampling)
+    payload.update(extra)
     if return_json:
         payload["response_format"] = {"type": "json_object"}
   

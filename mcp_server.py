@@ -6,6 +6,7 @@ Environment variables read at startup
     DVD_EMBED_BASE_URL    Embedding server, e.g. "http://localhost:8001/v1"
     DVD_API_KEY           API key (default: "EMPTY")
     DVD_VLM_MODEL         VLM model name
+    DVD_ENABLE_THINKING   Qwen3.5-4B thinking default (default: "true")
     DVD_EMBED_MODEL       Embedding model name (default: "BAAI/bge-m3")
     DVD_EMBED_DIM         Embedding vector dim (default: 1024)
     DVD_LITE_MODE         "true"/"false" (default: "true")
@@ -27,6 +28,7 @@ import threading
 import traceback
 
 import dvd.config as config
+from dvd.sampling import generation_context, qwen35_request_kwargs
 from dvd.utils import extract_answer
 from mcp.server.fastmcp import FastMCP
 
@@ -89,7 +91,7 @@ def _image_path_to_data_url(image_path: str) -> str:
 def _call_openai_compat(
     messages, endpoints=None, model_name=None, api_key=None,
     tools=None, image_paths=None, max_tokens=4096, temperature=0.0,
-    tool_choice="auto", return_json=False,
+    tool_choice="auto", return_json=False, enable_thinking=None,
 ):
     payload_messages = copy.deepcopy(messages)
     if image_paths:
@@ -105,6 +107,7 @@ def _call_openai_compat(
         max_tokens=max_tokens,
         temperature=temperature,
     )
+    kwargs.update(qwen35_request_kwargs(kwargs["model"], enable_thinking=enable_thinking))
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = tool_choice
@@ -258,6 +261,21 @@ async def run_dvd_query(
     question: str,
     dvd_db_dir: str = "",
     srt_path: str = "",
+    generation_kwargs: dict | None = None,
+) -> str:
+    """Run DVD with sampling settings scoped to this concurrent request."""
+    token = generation_context.set(generation_kwargs or {})
+    try:
+        return await _run_dvd_query(video_path, question, dvd_db_dir, srt_path)
+    finally:
+        generation_context.reset(token)
+
+
+async def _run_dvd_query(
+    video_path: str,
+    question: str,
+    dvd_db_dir: str = "",
+    srt_path: str = "",
 ) -> str:
     """
     Run the DVD agent on a local video file and return the answer.
@@ -320,7 +338,7 @@ async def run_dvd_query(
                         )
                     init_single_video_db(caption_path, db_path, _embed_dim)
 
-                await loop.run_in_executor(None, _build_db)
+                await asyncio.to_thread(_build_db)
 
             elif not (await loop.run_in_executor(None, os.path.isfile, caption_path)):
                 # Pre-extracted DB: database.json exists but captions.json absent.
@@ -365,7 +383,7 @@ async def run_dvd_query(
             traceback.print_exc(file=sys.stderr)
             raise
 
-    msgs = await loop.run_in_executor(None, _run_agent)
+    msgs = await asyncio.to_thread(_run_agent)
 
     if not msgs:
         return ""

@@ -3,6 +3,7 @@ import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from typing import Dict, List, Tuple
 
 from tqdm import tqdm
@@ -350,7 +351,7 @@ def process_video(
     # All concurrent videos share this executor, bounding aggregate VLM
     # pressure at _CAPTION_MAX_WORKERS.
     future_to_timestamp = {
-        _CAPTION_EXECUTOR.submit(_caption_clip, clip, caption_ckpt_folder): clip[0]
+        _CAPTION_EXECUTOR.submit(copy_context().run, _caption_clip, clip, caption_ckpt_folder): clip[0]
         for clip in clips
     }
     results = []

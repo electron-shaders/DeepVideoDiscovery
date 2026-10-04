@@ -68,6 +68,7 @@ def init_dvd_instance(
     dvd_venv_python: str = "python",
     dvd_host: str = "127.0.0.1",
     dvd_port: int = 9002,
+    enable_thinking: bool = True,
 ) -> None:
     """
     Launch the DVD MCP HTTP server as a background subprocess and wait for it
@@ -107,6 +108,9 @@ def init_dvd_instance(
         Host for the DVD MCP HTTP server (default: 127.0.0.1).
     dvd_port : int
         Port for the DVD MCP HTTP server (default: 9002).
+    enable_thinking : bool
+        Default Qwen3.5-4B mode; each query may override this through its
+        generation kwargs. DVD uses the official sampling preset for that mode.
     """
     global _initialized, _server_env, _dvd_venv_python, _mcp_server_script
     global _mcp_url, _server_proc
@@ -145,6 +149,7 @@ def init_dvd_instance(
             "DVD_DB_DIR":             dvd_db_dir,
             "DVD_HOST":               dvd_host,
             "DVD_PORT":               str(dvd_port),
+            "DVD_ENABLE_THINKING":    str(enable_thinking),
         }
 
         # Launch the DVD MCP server as a background subprocess.
@@ -190,6 +195,7 @@ async def run_dvd_query(
     max_iterations: int = None,
     lite_mode: bool = None,
     srt_path: Optional[str] = None,
+    generation_kwargs: Optional[dict] = None,
 ) -> str:
     """
     Run the DVD agent for a (video, question) pair via the MCP HTTP server.
@@ -228,6 +234,7 @@ async def run_dvd_query(
                         "question":   question,
                         "dvd_db_dir": dvd_db_dir,
                         "srt_path":   srt_path,
+                        "generation_kwargs": generation_kwargs or {},
                     },
                 )
         if result and result.content:
