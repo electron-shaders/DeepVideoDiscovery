@@ -35,6 +35,10 @@ def qwen35_request_kwargs(model_name: str, *, enable_thinking=None, generation=N
     generation = generation or {}
     extra = copy.deepcopy(generation.get("extra_body") or {})
     template = {**(generation.get("chat_template_kwargs") or {}), **(extra.get("chat_template_kwargs") or {})}
+    # DVD reasoning shares the output-token limit. Do not let stale task or
+    # launcher settings impose a separate thinking-token limit.
+    extra.pop("thinking_token_budget", None)
+    template.pop("thinking_token_budget", None)
     thinking = os.environ.get("DVD_ENABLE_THINKING", "true")
     thinking = generation.get("enable_thinking", thinking)
     thinking = template.get("enable_thinking", thinking)
