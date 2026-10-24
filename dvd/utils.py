@@ -213,37 +213,28 @@ class AzureOpenAIEmbeddingService:
             response.raise_for_status()
 
 def extract_answer(message: dict) -> str | None:
-    """
-    Extract the plain-text answer from an assistant message that may include
-    tool calls.
+    """Accept an assistant's finish answer or direct reply, never tool/user text."""
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return None
 
-    The function first checks the normal `content` field (for responses that
-    are not using tools). If the assistant responded via a tool call, it
-    attempts to parse the JSON string stored in
-    `message["tool_calls"][i]["function"]["arguments"]` and returns the value
-    associated with the key `"answer"`.
+    tool_calls = message.get("tool_calls") or []
+    for call in tool_calls:
+        function = call.get("function") or {}
+        if function.get("name") != "finish":
+            continue
+        try:
+            args = json.loads(function.get("arguments", ""))
+        except (TypeError, ValueError):
+            continue
+        answer = args.get("answer") if isinstance(args, dict) else None
+        if isinstance(answer, str) and answer.strip():
+            return answer.strip()
 
-    Parameters
-    ----------
-    message : dict
-        The assistant message returned by `call_openai_model_with_tools`.
-
-    Returns
-    -------
-    str | None
-        The extracted answer, or ``None`` if no answer could be found.
-    """
-    # Tool-based response
-    for call in message.get("tool_calls", []):
-        args_json = call["function"]["arguments"]
-        args = json.loads(args_json)
-        if (answer := args.get("answer")):
-            return answer
-
-    # Direct text response
-    if (content := message.get("content")):
-        return content.strip()
-    
+    # Text accompanying a tool call is an intermediate thought, not an answer.
+    if not tool_calls:
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
     return None
 
 

@@ -13,6 +13,7 @@ Environment variables read at startup
     DVD_MAX_ITERATIONS    int (default: 15)
     DVD_CLIP_SECS         int (default: 10)
     DVD_VIDEO_FPS         float (default: 2.0)
+    DVD_MAX_PIXELS        maximum pixels per VLM image (default: uncapped)
     DVD_GLOBAL_BROWSE_TOPK int (default: 300)
     DVD_DB_DIR            root dir for per-video databases (default: ./.dvd_dbs)
     DVD_HOST              host to listen on (default: 127.0.0.1)
@@ -22,11 +23,13 @@ Environment variables read at startup
 import base64
 import copy
 import json
+import math
 import os
 import sys
 import threading
 import traceback
 
+import cv2
 import dvd.config as config
 from dvd.sampling import generation_context, qwen35_request_kwargs
 from dvd.utils import extract_answer
@@ -46,6 +49,9 @@ _lite_mode      = os.environ.get("DVD_LITE_MODE", "true").lower() not in ("false
 _max_iter       = int(os.environ.get("DVD_MAX_ITERATIONS", "15"))
 _clip_secs      = int(os.environ.get("DVD_CLIP_SECS", "10"))
 _video_fps      = float(os.environ.get("DVD_VIDEO_FPS", "2.0"))
+_max_pixels     = int(os.environ["DVD_MAX_PIXELS"]) if os.environ.get("DVD_MAX_PIXELS") else None
+if _max_pixels is not None and _max_pixels <= 0:
+    raise ValueError("DVD_MAX_PIXELS must be positive")
 _browse_topk    = int(os.environ.get("DVD_GLOBAL_BROWSE_TOPK", "300"))
 _db_dir         = os.environ.get("DVD_DB_DIR", "./.dvd_dbs")
 _host           = os.environ.get("DVD_HOST", "127.0.0.1")
@@ -83,6 +89,20 @@ from tenacity import (
 
 
 def _image_path_to_data_url(image_path: str) -> str:
+    if _max_pixels is not None:
+        frame = cv2.imread(image_path)
+        if frame is None:
+            raise ValueError(f"Could not read image from path: {image_path}")
+        height, width = frame.shape[:2]
+        if width * height > _max_pixels:
+            scale = math.sqrt(_max_pixels / (width * height))
+            new_width = max(1, min(int(width * scale), _max_pixels))
+            new_height = max(1, min(int(height * scale), _max_pixels // new_width))
+            frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            ok, encoded = cv2.imencode(".jpg", frame)
+            if not ok:
+                raise ValueError(f"Could not encode image from path: {image_path}")
+            return "data:image/jpeg;base64," + base64.b64encode(encoded).decode("utf-8")
     with open(image_path, "rb") as f:
         data = base64.b64encode(f.read()).decode("utf-8")
     return f"data:image/jpeg;base64,{data}"
@@ -252,7 +272,7 @@ def query_video(video_url: str, question: str) -> str:
 
     agent = DVDCoreAgent(video_db_path, caption_file, config.MAX_ITERATIONS)
     msgs = agent.run(question)
-    return extract_answer(msgs[-1])
+    return (extract_answer(msgs[-1]) or "") if msgs else ""
 
 
 @mcp.tool()
@@ -296,7 +316,7 @@ async def _run_dvd_query(
     loop = asyncio.get_event_loop()
 
     from dvd.build_database import init_single_video_db
-    from dvd.dvd_core import DVDCoreAgent, StopException
+    from dvd.dvd_core import DVDCoreAgent
     from dvd.frame_caption import process_video, process_video_lite
     from nano_vectordb import NanoVectorDB
 
@@ -376,8 +396,6 @@ async def _run_dvd_query(
         agent = DVDCoreAgent(db_path, caption_path, _max_iter)
         try:
             return agent.run(question)
-        except StopException as exc:
-            return [str(exc)]
         except Exception as exc:
             print(f"[dvd_mcp_server] run_dvd_query failed: {exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
@@ -385,13 +403,9 @@ async def _run_dvd_query(
 
     msgs = await asyncio.to_thread(_run_agent)
 
-    if not msgs:
-        return ""
-    for msg in reversed(msgs):
-        answer = extract_answer(msg)
-        if answer:
-            return answer
-    return ""
+    # The agent records successful completion as its last assistant message.
+    # Never search backwards into intermediate thoughts or tool observations.
+    return (extract_answer(msgs[-1]) or "") if msgs else ""
 
 
 if __name__ == "__main__":

@@ -69,6 +69,7 @@ def init_dvd_instance(
     dvd_host: str = "127.0.0.1",
     dvd_port: int = 9002,
     enable_thinking: bool = True,
+    max_pixels: Optional[int] = None,
 ) -> None:
     """
     Launch the DVD MCP HTTP server as a background subprocess and wait for it
@@ -111,6 +112,8 @@ def init_dvd_instance(
     enable_thinking : bool
         Default Qwen3.5-4B mode; each query may override this through its
         generation kwargs. DVD uses the official sampling preset for that mode.
+    max_pixels : int, optional
+        Maximum pixels per frame sent to the VLM, including cached frames.
     """
     global _initialized, _server_env, _dvd_venv_python, _mcp_server_script
     global _mcp_url, _server_proc
@@ -150,6 +153,7 @@ def init_dvd_instance(
             "DVD_HOST":               dvd_host,
             "DVD_PORT":               str(dvd_port),
             "DVD_ENABLE_THINKING":    str(enable_thinking),
+            "DVD_MAX_PIXELS":         str(max_pixels) if max_pixels is not None else "",
         }
 
         # Launch the DVD MCP server as a background subprocess.
@@ -237,6 +241,8 @@ async def run_dvd_query(
                         "generation_kwargs": generation_kwargs or {},
                     },
                 )
+        if result and getattr(result, "isError", False):
+            raise RuntimeError("DVD MCP query failed: " + str(result.content))
         if result and result.content:
             return (
                 result.content[0].text

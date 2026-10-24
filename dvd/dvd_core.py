@@ -8,7 +8,7 @@ from dvd.build_database import (clip_search_tool, frame_inspect_tool,
                                 global_browse_tool, init_single_video_db)
 from dvd.func_call_shema import as_json_schema
 from dvd.func_call_shema import doc as D
-from dvd.utils import call_openai_model_with_tools
+from dvd.utils import call_openai_model_with_tools, extract_answer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TOPK = 16
@@ -21,7 +21,9 @@ class StopException(Exception):
 
 def finish(answer: A[str, D("Answer to the user's question.")]) -> None:
     """Call this function after confirming the answer of the user's question, and finish the conversation."""
-    raise StopException(answer)
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("answer must be a non-empty string")
+    raise StopException(answer.strip())
 
 
 class DVDCoreAgent:
@@ -47,7 +49,9 @@ class DVDCoreAgent:
   • ACTION   Call exactly one function that moves you closer to the final answer.
   • OBSERVATION Summarize the function's output.
 You MUST plan extensively before each function call, and reflect extensively on the outcomes of the previous function calls.
-Only pass arguments that come verbatim from the user or from earlier function outputs—never invent them. Continue the loop until the user's query is fully resolved, then end your turn with the final answer. If you are uncertain about code structure or video content, use the available tools to inspect rather than guessing. Plan carefully before each call and reflect on every result. Do not rely solely on blind function calls, as this degrades reasoning quality. Timestamps may be formatted as 'HH:MM:SS' or 'MM:SS'."""
+Only pass arguments that come verbatim from the user or from earlier function outputs—never invent them. Continue the loop until the user's query is fully resolved, then end your turn with the final answer. If you are uncertain about code structure or video content, use the available tools to inspect rather than guessing. Plan carefully before each call and reflect on every result. Do not rely solely on blind function calls, as this degrades reasoning quality. Timestamps may be formatted as 'HH:MM:SS' or 'MM:SS'.
+If a tool returns an error, correct the arguments or choose another tool and try again.
+When the question provides lettered options, answer with only the single uppercase option letter, without explanation or option text. Finish by calling finish with that letter, for example finish(answer="B")."""
             },
             {
                 "role": "user",
@@ -94,27 +98,31 @@ Question: QUESTION_PLACEHOLDER"""
             self._append_tool_msg(tool_call["id"], name, f"Invalid function name: {name!r}", msgs)
             return
 
-        # Parse arguments
+        # Return tool failures as observations so the next turn can correct them.
         try:
             args = json.loads(tool_call["function"]["arguments"])
-        except json.JSONDecodeError as exc:
-            raise StopException(f"Error decoding arguments: {exc!s}")
+            if not isinstance(args, dict):
+                raise ValueError("Tool arguments must be a JSON object")
 
-        if "database" in args:
-            args["database"] = self.video_db
-        
-        if "topk" in args:
-            if config.OVERWRITE_CLIP_SEARCH_TOPK > 0:
-                args["topk"] = config.OVERWRITE_CLIP_SEARCH_TOPK
+            if name in {"frame_inspect_tool", "clip_search_tool", "global_browse_tool"}:
+                args["database"] = self.video_db
 
-        # Call the tool
-        try:
+            if "topk" in args:
+                if config.OVERWRITE_CLIP_SEARCH_TOPK > 0:
+                    args["topk"] = config.OVERWRITE_CLIP_SEARCH_TOPK
+
             print(f"Calling function `{name}` with args: {args}")
             result = self.name_to_function_map[name](**args)
             self._append_tool_msg(tool_call["id"], name, result, msgs)
         except StopException as exc:  # graceful stop
             print(f"Finish task with message: '{exc!s}'")
             raise
+        except Exception as exc:
+            self._append_tool_msg(
+                tool_call["id"], name,
+                f"Error executing {name}: {type(exc).__name__}: {exc}. Correct the arguments or choose another tool and try again.",
+                msgs,
+            )
 
     # ------------------------------------------------------------------ #
     # Main loop
@@ -149,12 +157,15 @@ Question: QUESTION_PLACEHOLDER"""
 
             response.setdefault("role", "assistant")
             msgs.append(response)
+            if not response.get("tool_calls") and extract_answer(response):
+                return msgs
 
             # Execute any requested tool calls
             try:
                 for tool_call in (response.get("tool_calls", []) or []):
                     self._exec_tool(tool_call, msgs)
-            except StopException:
+            except StopException as exc:
+                msgs.append({"role": "assistant", "content": str(exc)})
                 return msgs
 
         return msgs
@@ -215,6 +226,8 @@ Question: QUESTION_PLACEHOLDER"""
             response.setdefault("role", "assistant")
             msgs.append(response)
             yield response  # ← stream assistant reply
+            if not response.get("tool_calls") and extract_answer(response):
+                return
 
             # Execute any requested tool calls
             try:
@@ -232,7 +245,8 @@ Question: QUESTION_PLACEHOLDER"""
                     # Only yield the tool result message
                     if msgs[-1].get("role") == "tool":
                         yield msgs[-1]  # ← stream tool observation
-            except StopException:
+            except StopException as exc:
+                yield {"role": "assistant", "content": str(exc)}
                 return
 
 
